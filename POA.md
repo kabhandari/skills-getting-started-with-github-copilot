@@ -11,7 +11,7 @@
 
 | # | Assumption |
 |---|-----------|
-| 1 | Schemas + validation + build logic packaged as `@symbium/config-engine` monorepo workspace. Both `Generate-Projects` scripts and `AHJ-Worksheet` consume the same package. Docker pulls required files from `Generate-Projects/` |
+| 1 | `Generate-Projects/` stays unchanged. A `package.json` is added to expose it as `@symbium/config-engine` workspace. Only `AHJ-Worksheet` uses the package name — existing scripts keep using relative paths. Docker copies only the schema module files needed |
 | 2 | Schema fields support a `hidden: true` key. Hidden fields are developer-only. V1 implements the "All Fields / Public Fields" toggle backed by this key |
 | 3 | **MySQL** for persistence |
 | 4 | Output is the **specifications folder** structure. Downstream `build-configs.js` and `generate` are separate steps |
@@ -111,24 +111,22 @@
 
 ## Monorepo & Config Engine Package
 
-### Why a shared package
+### Principle: Generate-Projects stays untouched
 
-The schema definitions, `SchemaManager`, `config-builder`, and `config-validator` are tightly coupled — a new field comes with its validator, calculator, and dependencies. They must be versioned as a single unit. Both the existing `Generate-Projects` scripts and the new `AHJ-Worksheet` app need them.
+Nothing in `Generate-Projects/` is restructured, moved, or renamed. Existing scripts, folder layout, and `require()` paths remain exactly as they are. The only addition is a `package.json` at the `Generate-Projects/` root that gives it an npm workspace name. This lets `AHJ-Worksheet` reference it as a dependency without duplicating code.
 
-Packaging them as a **monorepo workspace** (`@symbium/config-engine`) means both consumers resolve to the same local code — no publishing, no duplication, always in sync.
+### What AHJ-Worksheet needs from Generate-Projects
 
-### Package boundary
-
-**Inside `@symbium/config-engine`** (everything needed to define, validate, and build a configuration):
+The schema module (`schema/index.js`) and its internal dependencies:
 
 ```
-Generate-Projects/config-engine/           ← workspace package
-├── package.json                           ← name: @symbium/config-engine
+Generate-Projects/                         ← existing folder, UNCHANGED
+├── package.json                           ← NEW: adds workspace name + entry point
 ├── schema-classes.js                      ← SchemaManager, ValidationError, TypeValidators
 ├── lib/
-│   └── utilities.js                       ← load_json, discover_json_files
+│   └── utilities.js                       ← load_json (required by jurisdiction.js)
 ├── schema/
-│   ├── index.js                           ← main entry point (re-exports all)
+│   ├── index.js                           ← entry point (re-exports all)
 │   ├── schema-manager-instance.js         ← builds SchemaManager, loads specs
 │   ├── config-builder.js                  ← buildFromInputs, buildFromDirectory
 │   ├── config-validator.js                ← validateFromInputs, validateFromDirectory
@@ -138,34 +136,23 @@ Generate-Projects/config-engine/           ← workspace package
 │       ├── jurisdiction.js
 │       ├── projects/*.js
 │       └── scopes/*.js
-└── CHANGELOG.md
-```
-
-**Outside the package** (consumers / pipeline-specific):
-
-```
-Generate-Projects/
-├── validators/          ← downstream pipeline validators (ahj.js, pv_ess.js)
-├── builders/            ← downstream pipeline builders (symbium.js, api.js)
-├── specifications/      ← actual jurisdiction config data files
-├── built-configurations/← generated output
-└── lib/specification_compiler.js
+├── validators/                            ← NOT used by AHJ-Worksheet (pipeline-only)
+├── builders/                              ← NOT used by AHJ-Worksheet (pipeline-only)
+├── specifications/                        ← config data files (NOT schemas)
+├── built-configurations/                  ← generated output
+└── generate.js                            ← existing pipeline script
 ```
 
 ### Monorepo workspace setup
 
 ```
-Data-Scripting/                          ← repo root
-├── package.json                         ← workspaces: ["Generate-Projects/config-engine", "AHJ-Worksheet"]
-├── Generate-Projects/
-│   ├── config-engine/                   ← @symbium/config-engine workspace
-│   │   └── (schema + validation + build logic)
-│   ├── validators/
-│   ├── builders/
-│   ├── specifications/
-│   └── (existing scripts reference @symbium/config-engine)
-└── AHJ-Worksheet/                       ← worksheet app workspace
-    ├── package.json                     ← depends on @symbium/config-engine
+Data-Scripting/                            ← repo root
+├── package.json                           ← workspaces: ["Generate-Projects", "AHJ-Worksheet"]
+├── Generate-Projects/                     ← UNCHANGED — existing scripts work as before
+│   ├── package.json                       ← NEW file: name + entry point only
+│   └── (everything else stays as-is)
+└── AHJ-Worksheet/                         ← NEW — worksheet app workspace
+    ├── package.json                       ← depends on @symbium/config-engine
     ├── server/
     └── client/
 ```
@@ -176,13 +163,13 @@ Root `package.json`:
 {
   "private": true,
   "workspaces": [
-    "Generate-Projects/config-engine",
+    "Generate-Projects",
     "AHJ-Worksheet"
   ]
 }
 ```
 
-`Generate-Projects/config-engine/package.json`:
+`Generate-Projects/package.json` (new file — this is the **only change** to Generate-Projects):
 
 ```json
 {
@@ -206,9 +193,20 @@ Root `package.json`:
 }
 ```
 
-Both consumers use the exact same import:
+### How each consumer uses it
+
+**Existing Generate-Projects scripts** — nothing changes, relative paths continue to work:
 
 ```javascript
+// generate.js, etc. — UNCHANGED
+const schema = require('./schema');
+const { SchemaManager } = require('./schema-classes');
+```
+
+**AHJ-Worksheet** — uses the workspace package name:
+
+```javascript
+// AHJ-Worksheet/server/index.js
 const {
     schemaManager, schemaList,
     validateFromInputs, buildFromInputs,
@@ -216,9 +214,11 @@ const {
 } = require('@symbium/config-engine');
 ```
 
+npm workspaces resolve `@symbium/config-engine` → `Generate-Projects/` → `schema/index.js`. No files are copied or moved.
+
 ### Docker deployment
 
-The AHJ-Worksheet Dockerfile pulls only what it needs from the repo:
+The Dockerfile copies only the files AHJ-Worksheet needs from `Generate-Projects/` — the schema module and its dependencies, not the pipeline-specific folders:
 
 ```dockerfile
 FROM node:20-alpine
@@ -228,8 +228,11 @@ WORKDIR /app
 # Copy root workspace config
 COPY package.json package-lock.json ./
 
-# Copy the config-engine package
-COPY Generate-Projects/config-engine/ ./Generate-Projects/config-engine/
+# Copy only what the schema module needs from Generate-Projects
+COPY Generate-Projects/package.json ./Generate-Projects/
+COPY Generate-Projects/schema/ ./Generate-Projects/schema/
+COPY Generate-Projects/schema-classes.js ./Generate-Projects/
+COPY Generate-Projects/lib/utilities.js ./Generate-Projects/lib/
 
 # Copy the worksheet app
 COPY AHJ-Worksheet/ ./AHJ-Worksheet/
@@ -243,15 +246,15 @@ EXPOSE 3000
 CMD ["node", "server/index.js"]
 ```
 
-The image contains only `config-engine/` and `AHJ-Worksheet/` — not the full `Generate-Projects/` tree (no `validators/`, `builders/`, `specifications/`, `built-configurations/`).
+The image contains only the schema module files + `AHJ-Worksheet/`. Pipeline-specific folders (`validators/`, `builders/`, `specifications/`, `built-configurations/`) are not copied.
 
 ### Schema version tracking
 
-`schema_version` in the DB maps to the `version` field in `config-engine/package.json`. When schemas change:
+`schema_version` in the DB maps to the `version` field in `Generate-Projects/package.json`. When schemas evolve:
 
-1. Dev modifies schema files inside `config-engine/`
-2. Bumps `version` in `config-engine/package.json` (patch = constraints, minor = new fields, major = renames)
-3. Both `Generate-Projects` and `AHJ-Worksheet` immediately see the change (monorepo)
+1. Dev modifies schema files in `Generate-Projects/schema/specifications/` (as they do today)
+2. Bumps `version` in `Generate-Projects/package.json` (patch = constraints, minor = new fields, major = renames)
+3. AHJ-Worksheet immediately sees the change (monorepo — same local files)
 4. New configurations saved in the DB record `schema_version: "1.1.0"`
 5. V2 migration tooling can compare schema versions to detect field additions/renames
 
@@ -574,14 +577,14 @@ Validation required before publish. Draft can be saved with validation errors.
 
 | Task | Description | Est. |
 |------|------------|------|
-| 1.1 | **Monorepo & config-engine setup** — Create root `package.json` with workspaces. Extract `config-engine/` package from existing `schema/`, `schema-classes.js`, and `lib/utilities.js`. Update `require()` paths in existing Generate-Projects scripts. Verify existing scripts still work. Dockerfile for AHJ-Worksheet | 1.5h |
+| 1.1 | **Monorepo workspace setup** — Create root `package.json` with workspaces. Add `package.json` to `Generate-Projects/` (name: `@symbium/config-engine`, main: `schema/index.js`). No changes to existing scripts or paths. Dockerfile for AHJ-Worksheet that copies only schema module files | 1h |
 | 1.2 | **Project scaffolding** — Express backend + React/Vite frontend under `AHJ-Worksheet/`, depends on `@symbium/config-engine`, dev scripts, MySQL connection setup | 1h |
 | 1.3 | **Schema serialization API** — `GET /api/schemas` loads `@symbium/config-engine`, serializes to JSON metadata (types, static defaults, domains, explanations, `hidden` flag; marks dynamic fields). `GET /api/schemas/:name` for individual. Filters hidden fields based on role/toggle | 1.5h |
 | 1.4 | **MySQL setup + CRUD** — migration scripts for all tables (configurations, project_configs, scope_configs, documents, users), CRUD endpoints with `status` (draft/published), `version`, and `schema_version` (from config-engine package version) | 2h |
 | 1.5 | **Validation endpoint** — `POST /api/validate` calls `buildFromInputs()` + `validateConfigs()` from `@symbium/config-engine`, returns structured errors. Role-aware JSON preview endpoint `GET /api/configurations/:id/preview` (Dev only) | 1.5h |
 | 1.6 | **Export/Publish endpoint** — `POST /api/configurations/:id/publish` validates → updates status → creates branch `config/{jurisdiction_id}/{YYYYMMDD}` → pushes spec files → returns branch URL | 1.5h |
 
-**Day 1 Deliverable**: Monorepo with `@symbium/config-engine` workspace. Working backend — serves schemas (with hidden flag), persists to MySQL with draft/published states and schema versioning, validates via SchemaManager, publishes to GitHub branch. Dockerfile ready.
+**Day 1 Deliverable**: Monorepo workspace wired (`Generate-Projects/` untouched, only `package.json` added). Working backend — serves schemas (with hidden flag), persists to MySQL with draft/published states and schema versioning, validates via SchemaManager, publishes to GitHub branch. Dockerfile ready.
 
 ---
 
