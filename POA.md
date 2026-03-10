@@ -321,6 +321,71 @@ Hidden fields are excluded from the **UI** only, not from validation or building
 
 ---
 
+## User Workflow — Progressive Schema Loading
+
+The worksheet follows a step-by-step flow. Schemas are not all loaded at once — they load progressively as the user makes selections.
+
+```
+Step 1                    Step 2                       Step 3
+┌───────────────────┐     ┌────────────────────────┐   ┌─────────────────────────┐
+│ JURISDICTION      │     │ PROJECT SELECTION       │   │ PROJECT + SCOPE CONFIG  │
+│                   │     │                         │   │                         │
+│ Fill jurisdiction │────►│ Select project types    │──►│ For each selected       │
+│ schema fields     │     │ to onboard              │   │ project: load project   │
+│ (jurisdiction.js) │     │ (multi-select from      │   │ schema + its default    │
+│                   │     │  available projects)    │   │ scope schemas           │
+└───────────────────┘     └────────────────────────┘   └─────────────────────────┘
+```
+
+### Step 1 — Jurisdiction
+
+User fills in jurisdiction-level fields from `jurisdiction.js`: jurisdiction name, state, contact info, fees, integration settings, etc. This is the base configuration that applies to all projects.
+
+### Step 2 — Project Selection
+
+After jurisdiction fields are filled, user selects which project types to onboard from the available list (21 project types: `pv_ess`, `hvac`, `electrical_panel`, `cooler`, etc.). This is a multi-select — a jurisdiction can support multiple project types.
+
+### Step 3 — Project & Scope Configuration
+
+For each selected project type, the corresponding schemas are loaded:
+
+1. **Project schema** — e.g., selecting `pv_ess` loads `projects/pv_ess.js` (project-level config fields)
+2. **Scope schemas** — each project schema declares its default scopes (e.g., `pv_ess.js` has `scopes.default = ["pv_ess"]`). The corresponding scope schema (`scopes/pv_ess.js`) is loaded automatically.
+
+User fills in project-specific and scope-specific fields for each selected project. Each project type gets its own tab/section in the UI.
+
+### Example flow
+
+```
+1. User fills jurisdiction fields
+   → jurisdiction.js schema rendered as form
+
+2. User selects projects: ["pv_ess", "hvac"]
+   → API: GET /api/schemas/projects/pv_ess, GET /api/schemas/projects/hvac
+
+3. pv_ess has scopes.default = ["pv_ess"]
+   → API: GET /api/schemas/scopes/pv_ess
+
+4. hvac has scopes.default = ["hvac"]
+   → API: GET /api/schemas/scopes/hvac
+
+5. UI shows tabs:
+   [Jurisdiction] [PV/ESS ▼] [HVAC ▼]
+                   ├── Project config fields
+                   └── Scope: pv_ess config fields
+```
+
+### API support
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/schemas/jurisdiction` | Jurisdiction schema (loaded on page open) |
+| `GET /api/schemas/projects` | List of available project types (for the multi-select in Step 2) |
+| `GET /api/schemas/projects/:type` | Single project schema (loaded when user selects a project) |
+| `GET /api/schemas/scopes/:type` | Single scope schema (loaded based on project's `scopes.default`) |
+
+---
+
 ## Configuration Lifecycle
 
 ```
@@ -525,8 +590,10 @@ If a branch for the same jurisdiction + date already exists, append a sequence n
 
 | Method | Endpoint | Purpose | Role |
 |--------|---------|---------|------|
-| `GET` | `/api/schemas` | Serialized schema metadata | All |
-| `GET` | `/api/schemas/:name` | Single schema definition | All |
+| `GET` | `/api/schemas/jurisdiction` | Jurisdiction schema (loaded on page open — Step 1) | All |
+| `GET` | `/api/schemas/projects` | Available project types list (for multi-select — Step 2) | All |
+| `GET` | `/api/schemas/projects/:type` | Single project schema (loaded on project selection — Step 3) | All |
+| `GET` | `/api/schemas/scopes/:type` | Single scope schema (loaded based on project's default scopes — Step 3) | All |
 | `GET` | `/api/configurations` | List all configs (with status filter) | All |
 | `POST` | `/api/configurations` | Create new config (draft) | All |
 | `GET` | `/api/configurations/:id` | Get config with projects/scopes | All |
@@ -579,7 +646,7 @@ Validation required before publish. Draft can be saved with validation errors.
 |------|------------|------|
 | 1.1 | **Monorepo workspace setup** — Create root `package.json` with workspaces. Add `package.json` to `Generate-Projects/` (name: `@symbium/config-engine`, main: `schema/index.js`). No changes to existing scripts or paths. Dockerfile for AHJ-Worksheet that copies only schema module files | 1h |
 | 1.2 | **Project scaffolding** — Express backend + React/Vite frontend under `AHJ-Worksheet/`, depends on `@symbium/config-engine`, dev scripts, MySQL connection setup | 1h |
-| 1.3 | **Schema serialization API** — `GET /api/schemas` loads `@symbium/config-engine`, serializes to JSON metadata (types, static defaults, domains, explanations, `hidden` flag; marks dynamic fields). `GET /api/schemas/:name` for individual. Filters hidden fields based on role/toggle | 1.5h |
+| 1.3 | **Schema serialization API** — `GET /api/schemas/jurisdiction` for jurisdiction schema (Step 1), `GET /api/schemas/projects` for available project type list (Step 2), `GET /api/schemas/projects/:type` and `GET /api/schemas/scopes/:type` for progressive loading (Step 3). All serialize to JSON metadata with `hidden` flag, marks dynamic fields. Loaded from `@symbium/config-engine` | 1.5h |
 | 1.4 | **MySQL setup + CRUD** — migration scripts for all tables (configurations, project_configs, scope_configs, documents, users), CRUD endpoints with `status` (draft/published), `version`, and `schema_version` (from config-engine package version) | 2h |
 | 1.5 | **Validation endpoint** — `POST /api/validate` calls `buildFromInputs()` + `validateConfigs()` from `@symbium/config-engine`, returns structured errors. Role-aware JSON preview endpoint `GET /api/configurations/:id/preview` (Dev only) | 1.5h |
 | 1.6 | **Export/Publish endpoint** — `POST /api/configurations/:id/publish` validates → updates status → creates branch `config/{jurisdiction_id}/{YYYYMMDD}` → pushes spec files → returns branch URL | 1.5h |
@@ -593,8 +660,8 @@ Validation required before publish. Draft can be saved with validation errors.
 | Task | Description | Est. |
 |------|------------|------|
 | 2.1 | **Dashboard page** — list all jurisdictions (filterable by status: draft/published), search, "Create New" button, role selector in header | 1.5h |
-| 2.2 | **Dynamic form renderer** — schema-driven form fields, grouped by section, help text from `explanation`, localStorage auto-save on every edit (debounced), restore prompt on load | 3h |
-| 2.3 | **Project/scope management** — multi-select project types, auto-resolve default scopes, tabs for project/scope config forms | 1h |
+| 2.2 | **Jurisdiction form (Step 1)** — schema-driven form from `jurisdiction.js`, grouped by section, help text from `explanation`, localStorage auto-save on every edit (debounced), restore prompt on load | 2h |
+| 2.3 | **Project selection + progressive loading (Steps 2–3)** — multi-select project types from available list, on selection: fetch project schema + auto-resolve default scopes and fetch scope schemas. Render each project as a tab with project config fields and nested scope config fields | 2h |
 | 2.4 | **Draft/Publish workflow** — "Save Draft" button (always available), "Publish" button (Dev only, requires passing validation), status badge on dashboard, version history panel | 1.5h |
 | 2.5 | **S3 document upload** — drag-and-drop PDF upload, backend upload to S3, display uploaded doc links in form, wire into config fields | 1h |
 
@@ -624,7 +691,7 @@ Validation required before publish. Draft can be saved with validation errors.
 |---|---------|---------|
 | 1 | Open the worksheet | React SPA, dashboard lists all jurisdictions with status badges |
 | 2 | Toggle between public-key and full-schema view | UI toggle filters by `hidden` key in schema. Dev defaults to All Fields, Product defaults to Public Fields |
-| 3 | Create or edit jurisdiction configuration | Dynamic form, MySQL persistence, draft/publish states, localStorage for unsaved edits |
+| 3 | Create or edit jurisdiction configuration | Progressive flow: jurisdiction form → project selection → project/scope forms loaded on demand. MySQL persistence, draft/publish states, localStorage for unsaved edits |
 | 4 | Upload required jurisdiction document templates (PDFs) | S3 upload, URL stored in config |
 | 5 | Run schema validation | Server-side `SchemaManager.validateConfigs()`, errors inline + summary |
 | 6 | Build valid configurations | Dev-only JSON preview of generated specification files |
